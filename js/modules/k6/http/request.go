@@ -70,7 +70,7 @@ func (c *Client) Request(method string, url goja.Value, args ...goja.Value) (*Re
 		params = args[1]
 	}
 
-	req, err := c.parseRequest(method, url, body, params)
+	req, callback, err := c.parseRequest(method, url, body, params)
 	if err != nil {
 		if state.Options.Throw.Bool {
 			return nil, err
@@ -83,6 +83,24 @@ func (c *Client) Request(method string, url goja.Value, args ...goja.Value) (*Re
 			r.ErrorCode = int(k6e.Code)
 		}
 		return &Response{Response: r, client: c}, nil
+	}
+	if callback != nil {
+		callbackF := c.moduleInstance.vu.RegisterCallback()
+		go func() {
+			resp, err := httpext.MakeRequest(c.moduleInstance.vu.Context(), state, req) //nolint:govet
+			if err != nil {
+				callbackF(func() error {
+					_, e := callback(goja.Undefined(), nil, c.moduleInstance.vu.Runtime().ToValue(err))
+					return e
+				})
+			}
+			c.processResponse(resp, req.ResponseType)
+			callbackF(func() error {
+				_, e := callback(goja.Undefined(), c.moduleInstance.vu.Runtime().ToValue(resp))
+				return e
+			})
+		}()
+		return nil, nil //nolint:nilnil
 	}
 
 	resp, err := httpext.MakeRequest(c.moduleInstance.vu.Context(), state, req)
@@ -110,11 +128,11 @@ func (c *Client) responseFromHTTPext(resp *httpext.Response) *Response {
 //nolint: gocyclo, cyclop, funlen, gocognit
 func (c *Client) parseRequest(
 	method string, reqURL, body interface{}, params goja.Value,
-) (*httpext.ParsedHTTPRequest, error) {
+) (*httpext.ParsedHTTPRequest, goja.Callable, error) {
 	rt := c.moduleInstance.vu.Runtime()
 	state := c.moduleInstance.vu.State()
 	if state == nil {
-		return nil, ErrHTTPForbiddenInInitContext
+		return nil, nil, ErrHTTPForbiddenInInitContext
 	}
 
 	if urlJSValue, ok := reqURL.(goja.Value); ok {
@@ -122,7 +140,7 @@ func (c *Client) parseRequest(
 	}
 	u, err := httpext.ToURL(reqURL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	result := &httpext.ParsedHTTPRequest{
@@ -226,20 +244,20 @@ func (c *Client) parseRequest(
 				newData[k] = v.Export()
 			}
 			if err := handleObjectBody(newData); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case goja.ArrayBuffer:
 			result.Body = bytes.NewBuffer(data.Bytes())
 		case map[string]interface{}:
 			if err := handleObjectBody(data); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case string:
 			result.Body = bytes.NewBufferString(data)
 		case []byte:
 			result.Body = bytes.NewBuffer(data)
 		default:
-			return nil, fmt.Errorf("unknown request body type %T", body)
+			return nil, nil, fmt.Errorf("unknown request body type %T", body)
 		}
 	}
 
@@ -249,6 +267,7 @@ func (c *Client) parseRequest(
 		result.ActiveJar = state.CookieJar
 	}
 
+	var callback goja.Callable
 	// TODO: ditch goja.Value, reflections and Object and use a simple go map and type assertions?
 	if params != nil && !goja.IsUndefined(params) && !goja.IsNull(params) {
 		params := params.ToObject(rt)
@@ -321,7 +340,7 @@ func (c *Client) parseRequest(
 					algo = strings.TrimSpace(algo)
 					result.Compressions[index], err = httpext.CompressionTypeString(algo)
 					if err != nil {
-						return nil, fmt.Errorf("unknown compression algorithm %s, supported algorithms are %s",
+						return nil, nil, fmt.Errorf("unknown compression algorithm %s, supported algorithms are %s",
 							algo, httpext.CompressionTypeValues())
 					}
 				}
@@ -344,7 +363,7 @@ func (c *Client) parseRequest(
 			case "timeout":
 				t, err := types.GetDurationValue(params.Get(k).Export())
 				if err != nil {
-					return nil, fmt.Errorf("invalid timeout value: %w", err)
+					return nil, nil, fmt.Errorf("invalid timeout value: %w", err)
 				}
 				result.Timeout = t
 			case "throw":
@@ -352,7 +371,7 @@ func (c *Client) parseRequest(
 			case "responseType":
 				responseType, err := httpext.ResponseTypeString(params.Get(k).String())
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				result.ResponseType = responseType
 			case "responseCallback":
@@ -362,7 +381,11 @@ func (c *Client) parseRequest(
 				} else if c, ok := v.(*expectedStatuses); ok {
 					result.ResponseCallback = c.match
 				} else {
-					return nil, fmt.Errorf("unsupported responseCallback")
+					return nil, nil, fmt.Errorf("unsupported responseCallback")
+				}
+			case "callback":
+				if err := rt.ExportTo(params.Get(k), &callback); err != nil {
+					return nil, nil, fmt.Errorf("unsupported callback: %w", err)
 				}
 			}
 		}
@@ -372,7 +395,7 @@ func (c *Client) parseRequest(
 		httpext.SetRequestCookies(result.Req, result.ActiveJar, result.Cookies)
 	}
 
-	return result, nil
+	return result, callback, nil
 }
 
 func (c *Client) prepareBatchArray(requests []interface{}) (
@@ -535,7 +558,8 @@ func (c *Client) parseBatchRequest(key interface{}, val interface{}) (*httpext.P
 		reqURL = val
 	}
 
-	return c.parseRequest(method, reqURL, body, params)
+	req, _, err := c.parseRequest(method, reqURL, body, params)
+	return req, err
 }
 
 func requestContainsFile(data map[string]interface{}) bool {
